@@ -16,6 +16,7 @@ from django.urls import reverse
 from django.utils.timezone import now
 from rest_framework.exceptions import ValidationError
 
+from authentik.core.models import User
 from authentik.core.tests.utils import create_test_flow, create_test_user
 from authentik.flows.models import FlowStageBinding
 from authentik.flows.tests import APIFlowTestCase
@@ -209,6 +210,72 @@ class TestAuthenticatorEmailStage(APIFlowTestCase):
 
         device = self.get_flow_plan().context[PLAN_CONTEXT_EMAIL_DEVICE]
         self.assertEqual(device.email, self.user.email)
+
+    @patch(
+        "authentik.stages.authenticator_email.models.AuthenticatorEmailStage.backend_class",
+        PropertyMock(return_value=EmailBackend),
+    )
+    def test_submit_email_when_no_address_is_established(self):
+        """A user without an email can request a code at the address they enter."""
+        cache.clear()
+        self.addCleanup(cache.clear)
+        self.client.force_login(self.user_noemail)
+        url = reverse("authentik_api:flow-executor", kwargs={"flow_slug": self.flow.slug})
+        response = self.client.get(url)
+        self.assertStageResponse(response, self.flow, self.user_noemail, email_required=True)
+        self.assertEqual(len(mail.outbox), 0)
+
+        email = "otp@example.com"
+        response = self.client.post(
+            url, data={"component": "ak-stage-authenticator-email", "email": email}
+        )
+        self.assertStageResponse(
+            response, self.flow, self.user_noemail, email_required=False, response_errors={}
+        )
+        device = self.get_flow_plan().context[PLAN_CONTEXT_EMAIL_DEVICE]
+        self.assertEqual(device.email, email)
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertEqual(mail.outbox[0].to, [f"{self.user_noemail} <{email}>"])
+        self.assertIn(device.token, mail.outbox[0].body)
+        self.user_noemail.refresh_from_db()
+        self.assertEqual(self.user_noemail.email, "")
+
+    @patch("authentik.stages.authenticator_email.stage.send_mails")
+    def test_manual_email_is_not_assigned_when_sending_is_limited(self, send):
+        """A rejected first send does not establish an address or rotate the token."""
+        cache.clear()
+        self.addCleanup(cache.clear)
+        self.client.force_login(self.user_noemail)
+        email = "otp@example.com"
+        for _ in range(5):
+            email_is_rate_limited(email)
+        url = reverse("authentik_api:flow-executor", kwargs={"flow_slug": self.flow.slug})
+        self.client.get(url)
+        device = self.get_flow_plan().context[PLAN_CONTEXT_EMAIL_DEVICE]
+        token = device.token
+
+        response = self.client.post(
+            url, data={"component": "ak-stage-authenticator-email", "email": email}
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json()["response_errors"]["non_field_errors"][0]["code"], "throttled"
+        )
+        device = self.get_flow_plan().context[PLAN_CONTEXT_EMAIL_DEVICE]
+        self.assertEqual(device.email, "")
+        self.assertEqual(device.token, token)
+        send.assert_not_called()
+
+    @patch("authentik.stages.authenticator_email.stage.send_mails")
+    @patch.object(AuthenticatorEmailStageView, "get_pending_user")
+    def test_unsaved_pending_user_is_denied(self, get_pending_user, send):
+        """Unsaved users are denied before querying devices or attempting email delivery."""
+        get_pending_user.return_value = User()
+        response = self.client.get(
+            reverse("authentik_api:flow-executor", kwargs={"flow_slug": self.flow.slug})
+        )
+        self.assertStageResponse(response, self.flow, self.user, component="ak-stage-access-denied")
+        send.assert_not_called()
 
     @patch("authentik.stages.authenticator_email.stage.send_mails")
     def test_prefilled_email_rate_limit_does_not_retry(self, send):
